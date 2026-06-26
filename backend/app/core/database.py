@@ -74,7 +74,8 @@ async def init_db() -> None:
         _engine = create_async_engine(
             settings.database_url,
             echo=settings.debug,
-            pool_pre_ping=False,
+            pool_pre_ping=True,   # Detect stale connections before using them
+            pool_recycle=300,     # Recycle connections every 5 min (before MySQL wait_timeout)
             pool_size=5,
             max_overflow=10,
         )
@@ -158,6 +159,11 @@ async def get_dashboard_stats() -> dict:
 async def _load_records() -> list[dict[str, Any]]:
     session = await get_session()
     if session is None:
+        # DB not initialised — try to reconnect once before giving up
+        await _try_reconnect()
+        session = await get_session()
+
+    if session is None:
         return list(_memory_records)
 
     from app.models.database import VerificationRecord
@@ -169,12 +175,27 @@ async def _load_records() -> list[dict[str, Any]]:
             )
             rows = result.scalars().all()
             db_records = [_record_to_dict(row) for row in rows]
-            if db_records:
-                return db_records
+            # Always return DB records (even empty) when DB is reachable so we
+            # don't accidentally shadow DB data with stale in-memory entries.
+            return db_records
     except Exception as e:
         logger.error("load_verifications_failed", error=str(e))
+        # Connection may have gone stale — attempt a reconnect for the next call
+        await _try_reconnect()
 
     return list(_memory_records)
+
+
+async def _try_reconnect() -> None:
+    """Attempt to re-initialise the DB engine if it has become unavailable."""
+    global _db_available
+    if _db_available:
+        return  # Still marked available; pool_pre_ping will handle stale conns
+    try:
+        logger.info("database_reconnect_attempt")
+        await init_db()
+    except Exception as e:
+        logger.warning("database_reconnect_failed", error=str(e))
 
 
 def _record_to_dict(record: Any) -> dict[str, Any]:

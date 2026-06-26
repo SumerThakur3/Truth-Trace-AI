@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     database_url: str = "mysql+aiomysql://root:root@localhost:3306/truthtrace"
     # Set to true for hosted MySQL providers that require SSL (Aiven is auto-detected)
     database_ssl_required: bool = False
+    # Optional path to Aiven CA certificate (ca.pem from Aiven console)
+    database_ssl_ca: str = ""
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"

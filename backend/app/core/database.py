@@ -5,13 +5,18 @@ import ssl
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import unquote, urlparse
 
 import pymysql
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
+from app.core.db_url import (
+    database_host_hint,
+    get_resolved_db_url,
+    is_hosted_mysql_url,
+    is_render,
+)
 from app.core.logging import logger
 from app.models.database import Base
 
@@ -19,13 +24,17 @@ _engine = None
 _session_factory = None
 _memory_records: list[dict[str, Any]] = []
 _db_available = False
+_last_db_error: str | None = None
+_active_db_url: str | None = None
 
 
 def _parse_mysql_url(url: str) -> dict[str, Any]:
-    """Parse mysql+aiomysql://user:pass@host:port/dbname into connection parts."""
+    """Parse mysql URL into pymysql connection parts."""
+    from urllib.parse import unquote, urlparse
+
     normalized = url.replace("mysql+aiomysql://", "mysql://").replace("mysql+pymysql://", "mysql://")
     parsed = urlparse(normalized)
-    db_name = parsed.path.lstrip("/") or "truthtrace"
+    db_name = parsed.path.lstrip("/") or "defaultdb"
     return {
         "host": parsed.hostname or "localhost",
         "port": parsed.port or 3306,
@@ -35,42 +44,90 @@ def _parse_mysql_url(url: str) -> dict[str, Any]:
     }
 
 
-def _is_hosted_mysql(url: str) -> bool:
-    """Return True for cloud-hosted MySQL providers that manage the DB themselves."""
-    hosted_patterns = ["aivencloud.com", "planetscale", "railway.app", "supabase", "render.com"]
-    return any(p in url for p in hosted_patterns)
-
-
 def _needs_ssl(url: str) -> bool:
-    """Return True when the connection requires SSL (Aiven enforces it)."""
     settings = get_settings()
     if settings.database_ssl_required:
         return True
-    ssl_providers = ["aivencloud.com", "planetscale", "supabase"]
-    return any(p in url for p in ssl_providers)
+    if is_hosted_mysql_url(url):
+        return True
+    if is_render() and not ("localhost" in url or "127.0.0.1" in url):
+        return True
+    return False
 
 
 def _is_production_db() -> bool:
-    """True when using an external hosted database (data must survive restarts)."""
-    settings = get_settings()
-    url = settings.database_url
-    if _is_hosted_mysql(url):
+    url = _active_db_url or get_resolved_db_url()
+    if is_hosted_mysql_url(url):
         return True
-    # Any non-localhost URL is treated as production
     return "localhost" not in url and "127.0.0.1" not in url
 
 
-def ensure_mysql_database() -> None:
-    """Create the MySQL database if it does not exist (local dev only)."""
+def _ssl_strategies() -> list[dict[str, Any]]:
+    """Ordered SSL strategies for Aiven / Render (try strict first, then fallbacks)."""
     settings = get_settings()
-    if not settings.database_url.startswith("mysql"):
-        return
+    strategies: list[dict[str, Any]] = []
 
-    if _is_hosted_mysql(settings.database_url):
+    if settings.database_ssl_ca:
+        ctx = ssl.create_default_context(cafile=settings.database_ssl_ca)
+        strategies.append({"ssl": ctx, "label": "ca_file"})
+
+    ctx_verified = ssl.create_default_context()
+    strategies.append({"ssl": ctx_verified, "label": "verified"})
+
+    # aiomysql accepts plain True for encrypted connection
+    strategies.append({"ssl": True, "label": "ssl_true"})
+
+    # Render containers sometimes lack CA bundle — required fallback for Aiven
+    ctx_relaxed = ssl.create_default_context()
+    ctx_relaxed.check_hostname = False
+    ctx_relaxed.verify_mode = ssl.CERT_NONE
+    strategies.append({"ssl": ctx_relaxed, "label": "relaxed"})
+
+    return strategies
+
+
+def _connect_arg_variants(url: str) -> list[tuple[str, dict[str, Any]]]:
+    """Build connect_args variants to try at startup."""
+    base: dict[str, Any] = {"connect_timeout": 30}
+    variants: list[tuple[str, dict[str, Any]]] = []
+
+    if _needs_ssl(url):
+        for strat in _ssl_strategies():
+            args = {**base, "ssl": strat["ssl"]}
+            variants.append((strat["label"], args))
+    else:
+        variants.append(("no_ssl", base))
+
+    return variants
+
+
+def _sync_ping(url: str, connect_args: dict[str, Any]) -> None:
+    """Validate credentials with pymysql before creating async pool."""
+    parts = _parse_mysql_url(url)
+    ssl_arg = connect_args.get("ssl")
+    kwargs: dict[str, Any] = {
+        **parts,
+        "charset": "utf8mb4",
+        "connect_timeout": connect_args.get("connect_timeout", 30),
+    }
+    if ssl_arg is not None:
+        kwargs["ssl"] = ssl_arg
+
+    conn = pymysql.connect(**kwargs)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+    finally:
+        conn.close()
+
+
+def ensure_mysql_database(url: str) -> None:
+    """Create database locally only (never on Aiven/Render)."""
+    if is_hosted_mysql_url(url) or is_render():
         logger.info("mysql_database_skipped", reason="hosted_provider")
         return
 
-    parts = _parse_mysql_url(settings.database_url)
+    parts = _parse_mysql_url(url)
     db_name = parts.pop("database")
 
     if not re.match(r"^[a-zA-Z0-9_]+$", db_name):
@@ -90,66 +147,91 @@ def ensure_mysql_database() -> None:
         logger.warning("mysql_database_create_failed", error=str(e))
 
 
-def _build_connect_args(url: str) -> dict[str, Any]:
-    """Build aiomysql connect_args including SSL for Aiven."""
-    connect_args: dict[str, Any] = {"connect_timeout": 30}
-    if _needs_ssl(url):
-        # Aiven requires TLS; use default verified context
-        connect_args["ssl"] = ssl.create_default_context()
-        logger.info("database_ssl_enabled")
-    return connect_args
-
-
 async def init_db() -> None:
-    global _engine, _session_factory, _db_available
+    global _engine, _session_factory, _db_available, _last_db_error, _active_db_url
+
     settings = get_settings()
 
-    db_url = settings.database_url
-    # Render/Aiven often provide mysql:// — SQLAlchemy async needs mysql+aiomysql://
-    if db_url.startswith("mysql://"):
-        db_url = db_url.replace("mysql://", "mysql+aiomysql://", 1)
+    try:
+        db_url = get_resolved_db_url()
+    except ValueError as e:
+        _last_db_error = str(e)
+        _db_available = False
+        logger.error("database_url_invalid", error=str(e))
+        return
 
-    if not db_url.startswith("mysql"):
-        logger.warning("unsupported_database_url", url=db_url[:30])
+    _active_db_url = db_url
+    host = database_host_hint(db_url)
+
+    if _is_localhost_url(db_url) and is_render():
+        _last_db_error = (
+            "DATABASE_URL points to localhost on Render. "
+            "Set DATABASE_URL to your Aiven mysql+aiomysql:// connection string, "
+            "or set MYSQL_HOST, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE on Render."
+        )
+        logger.error("database_misconfigured", host=host, render=True)
         _db_available = False
         return
 
-    try:
-        ensure_mysql_database()
-        connect_args = _build_connect_args(db_url)
+    ensure_mysql_database(db_url)
+    last_error: Exception | None = None
 
-        _engine = create_async_engine(
-            db_url,
-            echo=settings.debug,
-            pool_pre_ping=False,  # aiomysql ping() is unreliable; we reconnect explicitly
-            pool_recycle=240,     # Recycle before Aiven idle timeout (~300s)
-            pool_size=3,
-            max_overflow=5,
-            connect_args=connect_args,
-        )
-        _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
+    for label, connect_args in _connect_arg_variants(db_url):
+        try:
+            _sync_ping(db_url, connect_args)
+            logger.info("database_sync_ping_ok", host=host, ssl_mode=label)
 
-        async with _engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            await conn.execute(text("SELECT 1"))
+            _engine = create_async_engine(
+                db_url,
+                echo=settings.debug,
+                pool_pre_ping=False,
+                pool_recycle=240,
+                pool_size=3,
+                max_overflow=5,
+                connect_args=connect_args,
+            )
+            _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
 
-        _db_available = True
-        count = await get_record_count()
-        logger.info(
-            "database_initialized",
-            driver="mysql",
-            ssl=bool(connect_args.get("ssl")),
-            records=count,
-        )
-    except Exception as e:
-        logger.warning("database_unavailable", error=str(e))
-        _engine = None
-        _session_factory = None
-        _db_available = False
+            async with _engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+                await conn.execute(text("SELECT 1"))
+
+            _db_available = True
+            _last_db_error = None
+            count = await get_record_count()
+            logger.info(
+                "database_initialized",
+                host=host,
+                ssl_mode=label,
+                records=count,
+            )
+            return
+        except Exception as e:
+            last_error = e
+            logger.warning(
+                "database_connect_attempt_failed",
+                host=host,
+                ssl_mode=label,
+                error=str(e)[:300],
+            )
+            if _engine is not None:
+                try:
+                    await _engine.dispose()
+                except Exception:
+                    pass
+            _engine = None
+            _session_factory = None
+
+    _db_available = False
+    _last_db_error = str(last_error)[:500] if last_error else "Unknown connection error"
+    logger.error("database_unavailable", host=host, error=_last_db_error)
+
+
+def _is_localhost_url(url: str) -> bool:
+    return "localhost" in url or "127.0.0.1" in url
 
 
 async def _dispose_engine() -> None:
-    """Tear down the connection pool (used after stale connections on Render wake-up)."""
     global _engine, _session_factory, _db_available
     if _engine is not None:
         try:
@@ -162,7 +244,6 @@ async def _dispose_engine() -> None:
 
 
 async def _force_reconnect() -> bool:
-    """Dispose stale pool and re-initialise. Returns True if DB is reachable."""
     logger.info("database_force_reconnect")
     await _dispose_engine()
     await init_db()
@@ -173,6 +254,20 @@ def is_db_available() -> bool:
     return _db_available
 
 
+def get_last_db_error() -> str | None:
+    return _last_db_error
+
+
+def get_db_status() -> dict[str, Any]:
+    url = _active_db_url or get_resolved_db_url()
+    return {
+        "available": _db_available,
+        "host": database_host_hint(url),
+        "error": _last_db_error,
+        "render": is_render(),
+    }
+
+
 async def get_session() -> AsyncSession | None:
     if _session_factory is None:
         return None
@@ -180,7 +275,6 @@ async def get_session() -> AsyncSession | None:
 
 
 async def get_record_count() -> int:
-    """Return total verification records in MySQL (0 if unavailable)."""
     session = await get_session()
     if session is None:
         return 0
@@ -197,7 +291,6 @@ async def get_record_count() -> int:
 
 
 async def save_verification(result: dict, session_id: str | None = None) -> None:
-    """Persist verification result to MySQL (required in production)."""
     memory_record = {
         **result,
         "session_id": session_id,
@@ -265,7 +358,6 @@ async def get_dashboard_stats() -> dict:
 
 
 async def _load_records() -> list[dict[str, Any]]:
-    """Load verification records from MySQL with reconnect retries."""
     from app.models.database import VerificationRecord
 
     for attempt in range(3):
@@ -283,16 +375,12 @@ async def _load_records() -> list[dict[str, Any]]:
                     .limit(1000)
                 )
                 rows = result.scalars().all()
-                db_records = [_record_to_dict(row) for row in rows]
-                logger.debug("records_loaded_from_mysql", count=len(db_records), attempt=attempt + 1)
-                return db_records
+                return [_record_to_dict(row) for row in rows]
         except Exception as e:
             logger.error("load_verifications_failed", error=str(e), attempt=attempt + 1)
             await _force_reconnect()
 
-    # Production: never mask a DB outage with empty in-memory data after Render restarts
     if _is_production_db():
-        logger.error("load_verifications_exhausted_retries", fallback="empty")
         return []
 
     return list(_memory_records)
@@ -300,10 +388,7 @@ async def _load_records() -> list[dict[str, Any]]:
 
 def _record_to_dict(record: Any) -> dict[str, Any]:
     created = record.created_at
-    if isinstance(created, datetime):
-        created_str = created.isoformat()
-    else:
-        created_str = str(created)
+    created_str = created.isoformat() if isinstance(created, datetime) else str(created)
     return {
         "id": str(record.id),
         "session_id": record.session_id,

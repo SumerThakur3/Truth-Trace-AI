@@ -223,7 +223,7 @@ function ChatContent() {
             m.id === assistantId ? { ...m, streamingStep: "Analyzing and verifying..." } : m
           )
         );
-        const result = (await verifyQuestion(question)) as VerificationResult;
+        const result = (await verifyQuestion(question)) as unknown as VerificationResult;
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId

@@ -34,10 +34,33 @@ def _parse_mysql_url(url: str) -> dict[str, Any]:
     }
 
 
+def _is_hosted_mysql(url: str) -> bool:
+    """Return True for cloud-hosted MySQL providers that manage the DB themselves."""
+    hosted_patterns = ["aivencloud.com", "planetscale", "railway.app", "supabase"]
+    return any(p in url for p in hosted_patterns)
+
+
+def _needs_ssl(url: str) -> bool:
+    """Return True when the connection requires SSL (Aiven enforces it)."""
+    settings = get_settings()
+    # Explicit override via env var DATABASE_SSL_REQUIRED=true
+    if getattr(settings, "database_ssl_required", False):
+        return True
+    # Auto-detect known SSL-required providers
+    ssl_providers = ["aivencloud.com", "planetscale", "supabase"]
+    return any(p in url for p in ssl_providers)
+
+
 def ensure_mysql_database() -> None:
     """Create the MySQL database if it does not exist."""
     settings = get_settings()
     if not settings.database_url.startswith("mysql"):
+        return
+
+    # Hosted providers (Aiven, PlanetScale, etc.) create the DB for you —
+    # attempting CREATE DATABASE will fail due to permissions. Skip it.
+    if _is_hosted_mysql(settings.database_url):
+        logger.info("mysql_database_skipped", reason="hosted_provider")
         return
 
     parts = _parse_mysql_url(settings.database_url)
@@ -71,13 +94,22 @@ async def init_db() -> None:
 
     try:
         ensure_mysql_database()
+
+        # Build connect_args — Aiven (and other hosted providers) require SSL.
+        connect_args: dict[str, Any] = {}
+        if _needs_ssl(settings.database_url):
+            connect_args["ssl"] = True
+            logger.info("database_ssl_enabled")
+
         _engine = create_async_engine(
             settings.database_url,
             echo=settings.debug,
-            pool_pre_ping=True,   # Detect stale connections before using them
-            pool_recycle=300,     # Recycle connections every 5 min (before MySQL wait_timeout)
+            pool_pre_ping=True,    # Detect stale connections before using them
+            pool_recycle=280,      # Recycle before Aiven's 300 s idle timeout
             pool_size=5,
             max_overflow=10,
+            connect_timeout=30,
+            connect_args=connect_args,
         )
         _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
 
@@ -86,7 +118,7 @@ async def init_db() -> None:
             await conn.execute(text("SELECT 1"))
 
         _db_available = True
-        logger.info("database_initialized", driver="mysql")
+        logger.info("database_initialized", driver="mysql", ssl=bool(connect_args.get("ssl")))
     except Exception as e:
         logger.warning("database_unavailable", error=str(e))
         _engine = None

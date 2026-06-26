@@ -97,6 +97,47 @@ Create `frontend/vercel.json`:
 
 ---
 
+## Render (Backend) + Aiven (MySQL)
+
+### Render environment variables
+
+Set these on your Render Web Service:
+
+```
+GEMINI_API_KEY=your-key
+GEMINI_MODEL=gemini-2.5-flash
+DATABASE_URL=mysql+aiomysql://avnadmin:PASSWORD@HOST:PORT/defaultdb
+DATABASE_SSL_REQUIRED=true
+TAVILY_API_KEY=your-tavily-key
+```
+
+**Important:** Use `mysql+aiomysql://` (not plain `mysql://`). SSL is auto-detected for `aivencloud.com` hosts.
+
+### Verify persistence after deploy
+
+After Render wakes from idle sleep, check:
+
+```
+GET https://your-render-app.onrender.com/api/v1/health
+```
+
+Response should show:
+
+```json
+{
+  "database": "connected",
+  "stored_verifications": 12
+}
+```
+
+If `stored_verifications` is 0 after you have asked questions, check Render logs for `save_verification_failed` or `database_unavailable`.
+
+### Why stats reset on free tier (fixed)
+
+Render free tier spins down after ~15 minutes idle. Previously, dashboard data lived only in server memory and was lost on restart. Analytics now **always load from Aiven MySQL** with automatic reconnect after wake-up.
+
+---
+
 ## AWS (Backend)
 
 ### Option A: ECS Fargate

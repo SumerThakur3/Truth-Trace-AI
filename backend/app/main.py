@@ -30,10 +30,14 @@ async def lifespan(app: FastAPI):
     gemini_status = await validate_gemini_connection()
     db_status = "connected" if is_db_available() else "unavailable"
 
+    from app.core.database import get_record_count
+    record_count = await get_record_count() if is_db_available() else 0
+
     logger.info(
         "truthtrace_started",
         version=__version__,
         database=db_status,
+        stored_verifications=record_count,
         gemini=gemini_status.get("status"),
     )
 

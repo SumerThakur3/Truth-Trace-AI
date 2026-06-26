@@ -1,13 +1,14 @@
-"""Database session management with MySQL auto-creation."""
+"""Database session management with MySQL auto-creation and resilient reconnects."""
 
 import re
+import ssl
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import unquote, urlparse
 
 import pymysql
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
@@ -36,29 +37,35 @@ def _parse_mysql_url(url: str) -> dict[str, Any]:
 
 def _is_hosted_mysql(url: str) -> bool:
     """Return True for cloud-hosted MySQL providers that manage the DB themselves."""
-    hosted_patterns = ["aivencloud.com", "planetscale", "railway.app", "supabase"]
+    hosted_patterns = ["aivencloud.com", "planetscale", "railway.app", "supabase", "render.com"]
     return any(p in url for p in hosted_patterns)
 
 
 def _needs_ssl(url: str) -> bool:
     """Return True when the connection requires SSL (Aiven enforces it)."""
     settings = get_settings()
-    # Explicit override via env var DATABASE_SSL_REQUIRED=true
-    if getattr(settings, "database_ssl_required", False):
+    if settings.database_ssl_required:
         return True
-    # Auto-detect known SSL-required providers
     ssl_providers = ["aivencloud.com", "planetscale", "supabase"]
     return any(p in url for p in ssl_providers)
 
 
+def _is_production_db() -> bool:
+    """True when using an external hosted database (data must survive restarts)."""
+    settings = get_settings()
+    url = settings.database_url
+    if _is_hosted_mysql(url):
+        return True
+    # Any non-localhost URL is treated as production
+    return "localhost" not in url and "127.0.0.1" not in url
+
+
 def ensure_mysql_database() -> None:
-    """Create the MySQL database if it does not exist."""
+    """Create the MySQL database if it does not exist (local dev only)."""
     settings = get_settings()
     if not settings.database_url.startswith("mysql"):
         return
 
-    # Hosted providers (Aiven, PlanetScale, etc.) create the DB for you —
-    # attempting CREATE DATABASE will fail due to permissions. Skip it.
     if _is_hosted_mysql(settings.database_url):
         logger.info("mysql_database_skipped", reason="hosted_provider")
         return
@@ -83,32 +90,41 @@ def ensure_mysql_database() -> None:
         logger.warning("mysql_database_create_failed", error=str(e))
 
 
+def _build_connect_args(url: str) -> dict[str, Any]:
+    """Build aiomysql connect_args including SSL for Aiven."""
+    connect_args: dict[str, Any] = {"connect_timeout": 30}
+    if _needs_ssl(url):
+        # Aiven requires TLS; use default verified context
+        connect_args["ssl"] = ssl.create_default_context()
+        logger.info("database_ssl_enabled")
+    return connect_args
+
+
 async def init_db() -> None:
     global _engine, _session_factory, _db_available
     settings = get_settings()
 
-    if not settings.database_url.startswith("mysql"):
-        logger.warning("unsupported_database_url", url=settings.database_url[:30])
+    db_url = settings.database_url
+    # Render/Aiven often provide mysql:// — SQLAlchemy async needs mysql+aiomysql://
+    if db_url.startswith("mysql://"):
+        db_url = db_url.replace("mysql://", "mysql+aiomysql://", 1)
+
+    if not db_url.startswith("mysql"):
+        logger.warning("unsupported_database_url", url=db_url[:30])
         _db_available = False
         return
 
     try:
         ensure_mysql_database()
-
-        # Build connect_args — Aiven (and other hosted providers) require SSL.
-        connect_args: dict[str, Any] = {}
-        if _needs_ssl(settings.database_url):
-            connect_args["ssl"] = True
-            logger.info("database_ssl_enabled")
+        connect_args = _build_connect_args(db_url)
 
         _engine = create_async_engine(
-            settings.database_url,
+            db_url,
             echo=settings.debug,
-            pool_pre_ping=True,    # Detect stale connections before using them
-            pool_recycle=280,      # Recycle before Aiven's 300 s idle timeout
-            pool_size=5,
-            max_overflow=10,
-            connect_timeout=30,
+            pool_pre_ping=False,  # aiomysql ping() is unreliable; we reconnect explicitly
+            pool_recycle=240,     # Recycle before Aiven idle timeout (~300s)
+            pool_size=3,
+            max_overflow=5,
             connect_args=connect_args,
         )
         _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
@@ -118,12 +134,39 @@ async def init_db() -> None:
             await conn.execute(text("SELECT 1"))
 
         _db_available = True
-        logger.info("database_initialized", driver="mysql", ssl=bool(connect_args.get("ssl")))
+        count = await get_record_count()
+        logger.info(
+            "database_initialized",
+            driver="mysql",
+            ssl=bool(connect_args.get("ssl")),
+            records=count,
+        )
     except Exception as e:
         logger.warning("database_unavailable", error=str(e))
         _engine = None
         _session_factory = None
         _db_available = False
+
+
+async def _dispose_engine() -> None:
+    """Tear down the connection pool (used after stale connections on Render wake-up)."""
+    global _engine, _session_factory, _db_available
+    if _engine is not None:
+        try:
+            await _engine.dispose()
+        except Exception as e:
+            logger.warning("engine_dispose_failed", error=str(e))
+    _engine = None
+    _session_factory = None
+    _db_available = False
+
+
+async def _force_reconnect() -> bool:
+    """Dispose stale pool and re-initialise. Returns True if DB is reachable."""
+    logger.info("database_force_reconnect")
+    await _dispose_engine()
+    await init_db()
+    return _db_available
 
 
 def is_db_available() -> bool:
@@ -136,8 +179,25 @@ async def get_session() -> AsyncSession | None:
     return _session_factory()
 
 
+async def get_record_count() -> int:
+    """Return total verification records in MySQL (0 if unavailable)."""
+    session = await get_session()
+    if session is None:
+        return 0
+
+    from app.models.database import VerificationRecord
+
+    try:
+        async with session:
+            result = await session.execute(select(func.count()).select_from(VerificationRecord))
+            return int(result.scalar() or 0)
+    except Exception as e:
+        logger.error("record_count_failed", error=str(e))
+        return 0
+
+
 async def save_verification(result: dict, session_id: str | None = None) -> None:
-    """Persist verification result to database and in-memory cache."""
+    """Persist verification result to MySQL (required in production)."""
     memory_record = {
         **result,
         "session_id": session_id,
@@ -149,35 +209,51 @@ async def save_verification(result: dict, session_id: str | None = None) -> None
     if len(_memory_records) > 1000:
         del _memory_records[:-1000]
 
-    session = await get_session()
-    if session is None:
-        return
-
     from app.models.database import VerificationRecord
 
-    try:
-        async with session:
-            record = VerificationRecord(
-                session_id=session_id,
-                question=result["question"],
-                answer=result["answer"],
-                confidence_score=result["confidence_score"],
-                verification_status=result["verification_status"],
-                sources_count=len(result.get("sources", [])),
-                contradictions_count=len(result.get("contradictions", [])),
-                sources=result.get("sources", []),
-                contradictions=result.get("contradictions", []),
-                trust_report=result.get("trust_report", {}),
-                claims=result.get("claims", []),
-            )
-            session.add(record)
-            await session.commit()
-            logger.info("verification_saved", question=result["question"][:50])
-    except Exception as e:
-        logger.error("save_verification_failed", error=str(e))
+    for attempt in range(3):
+        session = await get_session()
+        if session is None:
+            if await _force_reconnect():
+                continue
+            break
+
+        try:
+            async with session:
+                record = VerificationRecord(
+                    session_id=session_id,
+                    question=result["question"],
+                    answer=result["answer"],
+                    confidence_score=float(result["confidence_score"]),
+                    verification_status=result["verification_status"],
+                    sources_count=len(result.get("sources", [])),
+                    contradictions_count=len(result.get("contradictions", [])),
+                    sources=result.get("sources", []),
+                    contradictions=result.get("contradictions", []),
+                    trust_report=result.get("trust_report", {}),
+                    claims=result.get("claims", []),
+                )
+                session.add(record)
+                await session.commit()
+                logger.info(
+                    "verification_saved_to_mysql",
+                    question=result["question"][:50],
+                    attempt=attempt + 1,
+                )
+                return
+        except Exception as e:
+            logger.error("save_verification_failed", error=str(e), attempt=attempt + 1)
+            await _force_reconnect()
+
+    if _is_production_db():
+        logger.error(
+            "verification_not_persisted",
+            question=result["question"][:50],
+            reason="all_mysql_save_attempts_failed",
+        )
 
 
-async def get_verification_history(limit: int = 22) -> dict:
+async def get_verification_history(limit: int = 20) -> dict:
     records = await _load_records()
     records = sorted(records, key=lambda r: _coerce_datetime(r.get("created_at")), reverse=True)
     return {"records": records[:limit], "total": len(records)}
@@ -189,45 +265,37 @@ async def get_dashboard_stats() -> dict:
 
 
 async def _load_records() -> list[dict[str, Any]]:
-    session = await get_session()
-    if session is None:
-        # DB not initialised — try to reconnect once before giving up
-        await _try_reconnect()
-        session = await get_session()
-
-    if session is None:
-        return list(_memory_records)
-
+    """Load verification records from MySQL with reconnect retries."""
     from app.models.database import VerificationRecord
 
-    try:
-        async with session:
-            result = await session.execute(
-                select(VerificationRecord).order_by(VerificationRecord.created_at.desc()).limit(1000)
-            )
-            rows = result.scalars().all()
-            db_records = [_record_to_dict(row) for row in rows]
-            # Always return DB records (even empty) when DB is reachable so we
-            # don't accidentally shadow DB data with stale in-memory entries.
-            return db_records
-    except Exception as e:
-        logger.error("load_verifications_failed", error=str(e))
-        # Connection may have gone stale — attempt a reconnect for the next call
-        await _try_reconnect()
+    for attempt in range(3):
+        session = await get_session()
+        if session is None:
+            if await _force_reconnect():
+                continue
+            break
+
+        try:
+            async with session:
+                result = await session.execute(
+                    select(VerificationRecord)
+                    .order_by(VerificationRecord.created_at.desc())
+                    .limit(1000)
+                )
+                rows = result.scalars().all()
+                db_records = [_record_to_dict(row) for row in rows]
+                logger.debug("records_loaded_from_mysql", count=len(db_records), attempt=attempt + 1)
+                return db_records
+        except Exception as e:
+            logger.error("load_verifications_failed", error=str(e), attempt=attempt + 1)
+            await _force_reconnect()
+
+    # Production: never mask a DB outage with empty in-memory data after Render restarts
+    if _is_production_db():
+        logger.error("load_verifications_exhausted_retries", fallback="empty")
+        return []
 
     return list(_memory_records)
-
-
-async def _try_reconnect() -> None:
-    """Attempt to re-initialise the DB engine if it has become unavailable."""
-    global _db_available
-    if _db_available:
-        return  # Still marked available; pool_pre_ping will handle stale conns
-    try:
-        logger.info("database_reconnect_attempt")
-        await init_db()
-    except Exception as e:
-        logger.warning("database_reconnect_failed", error=str(e))
 
 
 def _record_to_dict(record: Any) -> dict[str, Any]:

@@ -10,6 +10,7 @@ from app.agents.orchestrator import VerificationOrchestrator
 from app.core.config import get_settings
 from app.core.database import (
     get_dashboard_stats,
+    get_record_count,
     get_verification_history,
     is_db_available,
     save_verification,
@@ -30,11 +31,13 @@ orchestrator = VerificationOrchestrator()
 async def health_check():
     settings = get_settings()
     gemini = await validate_gemini_connection()
+    record_count = await get_record_count() if is_db_available() else 0
     return {
         "status": "healthy",
         "version": __version__,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "database": "connected" if is_db_available() else "unavailable",
+        "stored_verifications": record_count,
         "gemini": gemini.get("status"),
         "gemini_model": settings.gemini_model if settings.gemini_api_key else None,
     }

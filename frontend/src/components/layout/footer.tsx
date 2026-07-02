@@ -34,10 +34,14 @@ export function Footer() {
           <div>
             <h4 className="font-semibold mb-4">Connect</h4>
             <div className="flex gap-3">
-              {[Github, Twitter, Linkedin].map((Icon, i) => (
+              {[Github, Linkedin].map((Icon, i) => (
                 <a
                   key={i}
-                  href="#"
+                 href={
+                       i === 0
+                       ? "https://github.com/SumerThakur3"
+                       : "https://www.linkedin.com/in/sumer-thakur-2486b62a7/"
+                       }
                   className="flex h-10 w-10 items-center justify-center rounded-xl bg-muted hover:bg-primary hover:text-white transition-all"
                 >
                   <Icon className="h-4 w-4" />
